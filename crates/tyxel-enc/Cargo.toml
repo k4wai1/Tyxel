@@ -1,0 +1,12 @@
+[package]
+name = "tyxel-enc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Tyxel encoder CLI: image/video -> .txa/.txv (pure Rust, no C bindings)"
+
+[dependencies]
+tyxel-core = { path = "../tyxel-core" }
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

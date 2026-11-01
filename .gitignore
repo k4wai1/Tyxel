@@ -1,0 +1,13 @@
+# Build
+/target/
+
+# Assets de prueba (imágenes y videos) — excluidos del repo
+/Test/
+
+# Editor / SO
+*.swp
+.DS_Store
+
+# Temporales de pruebas
+*.ansi
+*.txa.out

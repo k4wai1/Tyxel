@@ -1,0 +1,10 @@
+# Tyxel: optimizaciones ARM64 / Termux (aarch64-linux-android)
+# Se usa target-cpu=native en TODOS los perfiles para aprovechar
+# POPCNT (cnt) y NEON del Helio G99 (ARMv8.2-A).
+# Evitar LTO pesado en dev: incremental activado por defecto de cargo.
+
+[target.aarch64-linux-android]
+rustflags = ["-C", "target-cpu=native"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native"]
