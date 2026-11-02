@@ -114,7 +114,7 @@ const fn cube_value(level: u32) -> u8 {
 }
 
 /// Tabla de los 16 colores ANSI base (indices 0..=15).
-const ANSI_16: [[u8; 3]; 16] = [
+pub const ANSI_16: [[u8; 3]; 16] = [
     [0, 0, 0],
     [128, 0, 0],
     [0, 128, 0],

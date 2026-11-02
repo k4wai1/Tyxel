@@ -3,9 +3,11 @@
 > Regla: actualizar este archivo ANTES de iniciar cualquier tarea y justo después
 > de que `cargo test` pase en verde.
 
-Fecha de último estado: 2026-10-31
+Fecha de último estado: 2026-11-02
 
-## Estado global: FASE 2 COMPLETA + matcher de alta fidelidad + multicore + FPS nativo
+## Estado global: FASE 3 COMPLETA (render .txv/.txa -> MP4) + Fase 2 cerrada
+
+Nuevo: subcomando `tyxel-play render` con emulador de terminal virtual en RAM (tyxel-core/src/renderer.rs), glifos TTF vía fontdue o procedural 100% Rust, composición multicore por bandas, ffmpeg rawvideo por stdin, audio opcional, scanlines, quantización truecolor/256/16/mono.
 
 
 
@@ -20,12 +22,13 @@ Fecha de último estado: 2026-10-31
 | tyxel-core/txa.rs (texto + RLE `*N` + resizer) | LISTA | tokens `U+XXXX#RRGGBB[#RRGGBB][*N]` (+ literal Unicode de ancho 1, ADR-011) |
 | tyxel-core/txv.rs (contenedor binario) | LISTA | header 32 B, I/P deltas, LZ4, Seek Index + TYXELEND |
 | tyxel-enc (CLI codificador) | LISTA | subcomandos img/gif/video; calidad GIF por delay real; dedup de frames idénticos con hold_ms; keyframe interval 120; ffmpeg rawvideo subproceso |
-| tyxel-play (CLI reproductor) | LISTA | subcomandos play/cat/export/info; TerminalGuard RAII con degradación sin TTY; DEC 2026; caché fg/bg por fila; dirty-cells < 35 %; frame-skipping; color auto/truecolor/256/16/mono con Bayer |
+| tyxel-play (CLI reproductor) | LISTA | subcomandos play/cat/export/info/render; TerminalGuard RAII con degradación sin TTY; DEC 2026; caché fg/bg por fila; dirty-cells < 35 %; frame-skipping; flush único por frame; color auto/truecolor/256/16/mono con Bayer |
+| tyxel-core/renderer.rs (Fase 3) | LISTA | fit_geometry (celda 1:2 múltiplo entero), GlyphAtlas procedural/TTF (fontdue), compose_frame multicore por bandas, quant 256/16-Bayer/mono, scanlines; ver docs/RENDER_MP4_SPEC.md |
 | tests/golden_tests.rs (integración core) | LISTA | 8 tests |
-| tests/cli_e2e.rs (integración CLI en tyxel-play) | LISTA | PNG sintético en memoria → enc img → info/export/play; 2 tests |
+| tests/cli_e2e.rs (integración CLI en tyxel-play) | LISTA | PNG sintético en memoria → enc img → info/export/play + E2E render→MP4 con validación ffprobe (3 tests) |
 
 ## Tests pasando
-* `cargo test --workspace`: 52 tests en verde (40 lib core + 8 golden + 2 unit play + 2 e2e CLI).
+* `cargo test --workspace`: 60 tests en verde (47 lib core + 8 golden + 2 unit play + 3 e2e CLI; los 5 r-units nuevos de renderer.rs incluidos en los 47).
 * clippy --workspace: sin errores; ~18 warnings de estilo en const-fns de
   tyxel-core (`is_multiple_of`/`div_ceil` no son const-stables) — no bloquean.
 * Humo manual: PNG 64×64 → `.txa` → `info` (64x32, 3.3 % planas, 7 glifos),
@@ -91,6 +94,31 @@ Resultados de los 4 videos (todos `--height 20 --fps 15`, todos `play` OK):
 | 1280x720 | 71x20 | 198 | 2/196 | 13.1 s | 2.1 MB |
 | YouCut (portrait) | 80x20(?) | 343 | 3/340 | 22.6 s | 3.2 MB |
 
+
+## Fase 3: `tyxel-play render` (.txv/.txa -> MP4): 2026-11-02 COMPLETA
+
+* `tyxel-core/src/renderer.rs` NUEVO: `fit_geometry` (celda 1:2 entera maximal
+  centrada, background #0D1117), `GlyphAtlas::procedural` (super-sampling 4x4,
+  alphas 0..=255, ~576 KB con celda 24x48) y `GlyphAtlas::from_font` (fontdue
+  0.9, 100 % Pure Rust; baseline al 80 %, centrado horizontal), `effective_colors`
+  (truecolor / 256 / 16-Bayer / mono) y `compose_frame` multicore (thread::scope
+  + bytes en bandas disjuntas, RUM en buf reutilizable, blending entero).
+* `tyxel-play render` NUEVO: flags --res 720p|1080p|WxH|auto (default 1080p),
+  --fps (default del archivo; .txa=30), --color, --font (auto ~/.termux/font.ttf),
+  --audio-from (map v:0 + 1:a:0? ; aac + -shortest), --scanlines (ultima fila
+  logica al 84 %). Feed ffmpeg: `-f rawvideo -pix_fmt rgb24 -i pipe:0 -c:v
+  libx264 -preset veryfast -crf 18 -pix_fmt yuv420p`.
+* Duracion exacta: repeats = round(duration_ms * fps / 1000) min 1 (un marco
+  .txv de 33 ms a --fps 60 => 2 ticks, sin alterar la velocidad percibida).
+* Smoke real (Termux):
+  * icon.jpg (40x20) -> txa -> MP4 720p, ffprobe h264 1280x720 x1.
+  * 720x576.txv (1200 frames, audio): MP4 1280x720x1200 + pista aac OK,
+    342 % CPU multicore, 1:08 para 40 s de video.
+  * 1280x720.txv --res auto --color 16 --scanlines: 424x240x393 OK.
+  * YouCut.txv 2:1 --res 1280x640 --color mono --fps 24: cadencia rescaldada OK.
+* Tests: 5 unitarios en renderer.rs (geometria, composicion central/padding,
+  paralelo == serial, paletas cuantizadas, scanlines) + E2E render -> ffprobe.
+  Total workspace: 60 tests verdes. Cargo.toml de tyxel-core gana `fontdue = "0.9"`.
 
 ## Posibles siguientes pasos (v1.1)
 * Streaming .txv real (TxvReader incremental en vez de parse completo) para

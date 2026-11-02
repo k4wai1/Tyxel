@@ -129,3 +129,75 @@ fn cli_e2e_txv_play_smoke() {
     std::fs::remove_file(&png).ok();
     std::fs::remove_file(&txv_path).ok();
 }
+
+#[test]
+fn cli_e2e_render_txa_to_mp4() {
+    // E2E Fase 3: render <txa> -> MP4 y validacion de geometria por ffprobe.
+    let have_ffmpeg = Command::new("ffmpeg").arg("-version").output().is_ok();
+    let have_ffprobe = Command::new("ffprobe").arg("-version").output().is_ok();
+    if !have_ffmpeg || !have_ffprobe {
+        eprintln!("ffmpeg/ffprobe no instalado: E2E de render omitido");
+        return;
+    }
+    let dir = std::env::temp_dir();
+    let png = synth_png(&dir, "render");
+    let txa_path = dir.join("tyxel_e2e_render.txa");
+    let mp4_path = dir.join("tyxel_e2e_render.mp4");
+    let _ = std::fs::remove_file(&mp4_path);
+    let png_arg = png.to_str().unwrap().to_string();
+    let txa_arg = txa_path.to_str().unwrap().to_string();
+    let mp4_arg = mp4_path.to_str().unwrap().to_string();
+    let (code, out, err) = run(
+        &enc_bin(),
+        &[
+            "img", &png_arg, "-o", &txa_arg, "--width", "20", "--height", "10",
+        ],
+    );
+    assert_eq!(code, 0, "enc img->txa fallo: {out} {err}");
+    let (code, out, err) = run(
+        &play_bin(),
+        &[
+            "render",
+            &txa_arg,
+            "-o",
+            &mp4_arg,
+            "--res",
+            "720p",
+            "--fps",
+            "10",
+            "--scanlines",
+        ],
+    );
+    assert_eq!(code, 0, "render fallo: {out} {err}");
+    assert!(mp4_path.exists(), "el MP4 no se creo");
+    let probe = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,nb_frames,codec_name",
+            "-of",
+            "csv=s=x:p=0",
+            &mp4_arg,
+        ])
+        .output()
+        .expect("ffprobe");
+    let info = String::from_utf8_lossy(&probe.stdout).into_owned();
+    assert_eq!(code, 0, "ffprobe fallo: {info}");
+    // ffprobe csv=s=x:p=0 emite: codec_name x width x height x nb_frames.
+    let parts: Vec<&str> = info.trim().split('x').collect();
+    assert!(parts.len() >= 4, "ffprobe csv inesperado: {info}");
+    assert!(parts[0].contains("h264"), "codec: {info}");
+    let w: u32 = parts[1].parse().expect("width");
+    let h: u32 = parts[2].parse().expect("height");
+    let frames: u32 = parts[3].parse().expect("nb_frames");
+    // celda 36x72, canvas 720x720 centrado en lienzo 1280x720 (720p).
+    assert_eq!(w, 1280, "el lienzo debe ser 720p: {info}");
+    assert_eq!(h, 720);
+    assert_eq!(frames, 1, "un solo frame: {info}");
+    std::fs::remove_file(&png).ok();
+    std::fs::remove_file(&txa_path).ok();
+    std::fs::remove_file(&mp4_path).ok();
+}

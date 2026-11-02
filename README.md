@@ -43,6 +43,10 @@ The repository ships four real videos plus their ready-made `.txv` files
 # Print a static .txa to the terminal / export ready-to-consume ANSI
 ./target/release/tyxel-play cat Test/logo.txa
 ./target/release/tyxel-play export Test/logo.txa -o logo.ansi
+
+# Render a .txv/.txa to a real MP4 (virtual terminal emulator + H.264)
+./target/release/tyxel-play render Test/video.txv -o out.mp4 --res 1080p --fps 30 \
+  [--font my.ttf] [--color 256|16|mono] [--audio-from original.mp4] [--scanlines]
 ```
 
 ## Encoding

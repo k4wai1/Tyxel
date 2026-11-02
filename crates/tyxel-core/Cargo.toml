@@ -7,5 +7,6 @@ authors.workspace = true
 description = "Tyxel core library: Tyxel struct, logical atlas, matcher and .txa/.txv codecs (pure Rust)"
 
 [dependencies]
+fontdue = "0.9"
 lz4_flex = { workspace = true }
 unicode-width = { workspace = true }

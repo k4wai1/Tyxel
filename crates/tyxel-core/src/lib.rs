@@ -9,6 +9,7 @@
 
 pub mod atlas;
 pub mod matcher;
+pub mod renderer;
 pub mod txa;
 pub mod txv;
 pub mod tyxel;

@@ -5,6 +5,9 @@
 //!   tyxel cat <FILE.txa> [--width W] [--height H] [--fit contain|cover] [--color ...]
 //!   tyxel export <FILE.txa> -o OUT.ansi [--width ...] [--height ...] [--fit ...] [--color ...]
 //!   tyxel info <FILE>
+//!   tyxel render <FILE> -o OUT.mp4 [--res 720p|1080p|WxH|auto] [--fps N]
+//!                 [--color truecolor|256|16|mono] [--font F.ttf]
+//!                 [--audio-from ORIGINAL.mp4] [--scanlines]
 //!
 //! Nota de plataforma (Android/Termux): el módulo `term` usa `libc`
 //! (tcgetattr/tcsetattr) en lugar del crate `termios`, porque el layout que
@@ -21,6 +24,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use tyxel_core::atlas;
+use tyxel_core::renderer::GlyphAtlas;
+use tyxel_core::renderer::{QuantMode, compose_frame, fit_geometry};
 use tyxel_core::txa::{self, TxaImage};
 use tyxel_core::txv::{self, Txv, TxvFrame};
 use tyxel_core::tyxel::{Tyxel, rgb_to_ansi16_dithered, rgb_to_ansi256};
@@ -98,6 +103,32 @@ enum Cmd {
         /// Ruta del archivo.
         file: PathBuf,
     },
+    /// Renderiza un .txv/.txa a MP4 emulando una terminal virtual (Fase 3).
+    Render {
+        /// Ruta del archivo .txv o .txa.
+        file: PathBuf,
+        /// Ruta del MP4 de salida.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Resolución del lienzo: 720p, 1080p, WxH o auto (cols*8 x rows*16).
+        #[arg(long, default_value = "1080p")]
+        res: String,
+        /// FPS de salida; por defecto el del archivo (30 en .txa).
+        #[arg(long)]
+        fps: Option<u32>,
+        /// Modo de color de la paleta.
+        #[arg(long, default_value = "truecolor")]
+        color: QuantArg,
+        /// Fuente TTF para rasterizar los glifos (default: ~/.termux/font.ttf).
+        #[arg(long)]
+        font: Option<PathBuf>,
+        /// Video original del que copiar la pista de audio.
+        #[arg(long)]
+        audio_from: Option<PathBuf>,
+        /// Atenúa la última fila lógica de cada celda (efecto CRT sutil).
+        #[arg(long)]
+        scanlines: bool,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -125,6 +156,33 @@ enum FitArg {
     Contain,
     /// Cubre el lienzo completo y recorta el exceso centrado.
     Cover,
+}
+
+#[derive(Copy, Clone, ValueEnum)]
+enum QuantArg {
+    /// RGB TrueColor 24 bits.
+    #[value(name = "truecolor")]
+    Truecolor,
+    /// Paleta xterm-256.
+    #[value(name = "256")]
+    C256,
+    /// 16 colores ANSI con dithering Bayer.
+    #[value(name = "16")]
+    C16,
+    /// Blanco sobre negro.
+    #[value(name = "mono")]
+    Mono,
+}
+
+impl QuantArg {
+    const fn quant(self) -> QuantMode {
+        match self {
+            QuantArg::Truecolor => QuantMode::TrueColor,
+            QuantArg::C256 => QuantMode::Ansi256,
+            QuantArg::C16 => QuantMode::Ansi16,
+            QuantArg::Mono => QuantMode::Mono,
+        }
+    }
 }
 
 // ============================================================================
@@ -958,6 +1016,238 @@ fn cmd_info(file: &Path) -> Result<(), AppError> {
 }
 
 // ============================================================================
+// Fase 3: render a MP4 (emulador de terminal virtual + ffmpeg rawvideo)
+// ============================================================================
+
+/// Convierte un especto de resolucion (`720p`, `1080p`, `1280x720`, `auto`) en
+/// dimensiones del lienzo RGB24. `yuv420p` exige dimensiones pares.
+fn parse_res(spec: &str, cols: u16, rows: u16) -> Result<(u32, u32), AppError> {
+    let bad = || {
+        AppError::Parse(format!(
+            "resolucion invalida: '{}' (usa 720p|1080p|WxH|auto)",
+            spec
+        ))
+    };
+    let (w, h) = match spec {
+        "720p" => (1280_u32, 720_u32),
+        "1080p" => (1920, 1080),
+        "auto" | "native" => (cols as u32 * 8, rows as u32 * 16),
+        _ => {
+            let (a, b) = spec.split_once('x').ok_or_else(bad)?;
+            (
+                a.trim().parse().map_err(|_| bad())?,
+                b.trim().parse().map_err(|_| bad())?,
+            )
+        }
+    };
+    if w == 0 || h == 0 || w > 8192 || h > 8192 {
+        return Err(bad());
+    }
+    // Redondeo hacia arriba para garantizar paridad de yuv420p.
+    let even = |v: u32| v + (v & 1);
+    Ok((even(w), even(h)))
+}
+
+/// Resuelve el atlas de cobertura: TTF pedido por el usuario, o
+/// `~/.termux/font.ttf` si existe, o el atlas procedural 100% Rust.
+fn resolve_render_atlas(
+    font: Option<&Path>,
+    cell_w: usize,
+    cell_h: usize,
+) -> Result<GlyphAtlas, AppError> {
+    let candidates: Vec<PathBuf> = match font {
+        Some(p) => vec![p.to_path_buf()],
+        None => {
+            let mut v = Vec::new();
+            if let Some(home) = std::env::var_os("HOME") {
+                let p = Path::new(&home).join(".termux").join("font.ttf");
+                if p.exists() {
+                    v.push(p);
+                }
+            }
+            v
+        }
+    };
+    for p in &candidates {
+        let data = match std::fs::read(p) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if let Some(a) = GlyphAtlas::from_font(data, cell_w, cell_h) {
+            return Ok(a);
+        }
+        eprintln!(
+            "tyxel-play: aviso: fuente '{}' no legible, fallback procedural",
+            p.display()
+        );
+    }
+    Ok(GlyphAtlas::procedural(cell_w, cell_h))
+}
+
+/// Opciones del subcomando `render` (agrupadas para clippy::too_many_arguments).
+struct RenderOpts<'a> {
+    output: &'a Path,
+    res: &'a str,
+    fps: Option<u32>,
+    color: QuantArg,
+    font: Option<&'a Path>,
+    audio_from: Option<&'a Path>,
+    scanlines: bool,
+}
+
+/// Un comando de resolucion viene en el argumento --res.
+fn cmd_render(file: &Path, opts: &RenderOpts) -> Result<(), AppError> {
+    let RenderOpts {
+        output,
+        res,
+        fps,
+        color,
+        font,
+        audio_from,
+        scanlines,
+    } = *opts;
+    let src = load_play_source(file, None)?;
+    if fps.iter().any(|f| !(1..=240).contains(f)) {
+        return Err(AppError::Parse(format!("fps fuera de rango: {:?}", fps)));
+    }
+    let fps = fps.unwrap_or((src.fps_tag.round().max(1.0)) as u32);
+    let (w, h) = parse_res(res, src.width, src.height)?;
+    let geo = fit_geometry(
+        src.width as usize,
+        src.height as usize,
+        w as usize,
+        h as usize,
+    );
+    eprintln!(
+        "render: {}x{} celdas -> celda {}x{}, lienzo {}x{} (off {},{} canvas {}x{}) @ {} fps",
+        src.width,
+        src.height,
+        geo.cell_w,
+        geo.cell_h,
+        geo.out_w,
+        geo.out_h,
+        geo.off_x,
+        geo.off_y,
+        geo.cell_w * src.width as usize,
+        geo.cell_h * src.height as usize,
+        fps
+    );
+    let canvas_w = geo.cell_w * src.width as usize;
+    let canvas_h = geo.cell_h * src.height as usize;
+    if canvas_w < 1 || canvas_h < 1 {
+        return Err(AppError::Parse(format!(
+            "la resolucion {}x{} es demasado pequena para {}x{} celdas",
+            w, h, src.width, src.height
+        )));
+    }
+    let atlas = resolve_render_atlas(font, geo.cell_w, geo.cell_h)?;
+    let quant = color.quant();
+
+    // ffmpeg consume RGB24 crudo por stdin a cadencia fija.
+    let mut cmd = process::Command::new("ffmpeg");
+    cmd.arg("-y")
+        .args(["-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24"])
+        .args(["-s", &format!("{}x{}", w, h)])
+        .args(["-r", &fps.to_string(), "-i", "pipe:0"]);
+    if let Some(a) = audio_from {
+        if !a.exists() {
+            return Err(AppError::Io(format!(
+                "--audio-from no existe: {}",
+                a.display()
+            )));
+        }
+        cmd.arg("-i")
+            .arg(a)
+            .args(["-map", "0:v:0", "-map", "1:a:0?"]);
+    }
+    cmd.args([
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+    ]);
+    if audio_from.is_some() {
+        cmd.args(["-c:a", "aac", "-shortest"]);
+    }
+    cmd.arg(output);
+    let mut child = cmd
+        .stdin(process::Stdio::piped())
+        .stderr(process::Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            AppError::Io(format!(
+                "no pude lanzar ffmpeg (instalalo con `pkg install ffmpeg`): {}",
+                e
+            ))
+        })?;
+    let mut writer = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::Io("ffmpeg cerro su stdin".to_string()))?;
+
+    let mut emitted = 0_u64;
+    for (i, frame) in src.frames.iter().enumerate() {
+        let ms = if frame.duration_ms == 0 {
+            src.default_ms
+        } else {
+            frame.duration_ms as u64
+        };
+        // La duracion del frame manda: repetir el fotograma hasta cubrirla
+        // a la cadencia pedida (minimo 1; duracion 0 => un frame).
+        let repeats = (((ms as f64) * (fps as f64) / 1000.0).round().max(1.0)) as u64;
+        let buf = compose_frame(
+            &geo,
+            &frame.cells,
+            src.width as usize,
+            &atlas,
+            quant,
+            scanlines,
+            tyxel_core::renderer::DEFAULT_BG,
+            1,
+        );
+        for _ in 0..repeats {
+            writer.write_all(&buf).map_err(io_err)?;
+            emitted += 1;
+        }
+        if i % 60 == 0 || i + 1 == src.frames.len() {
+            eprint!(
+                "\rrender: frame {}/{} (emitidos {})   ",
+                i + 1,
+                src.frames.len(),
+                emitted
+            );
+            let _ = io::stderr().flush();
+        }
+    }
+    eprintln!();
+    drop(writer);
+    let status = child.wait().map_err(io_err)?;
+    let secs = emitted as f64 / fps as f64;
+    eprintln!(
+        "render: {} frames emitidos ({:.2} s) -> ffprobe:",
+        emitted, secs
+    );
+    if !status.success() {
+        return Err(AppError::Io(format!(
+            "ffmpeg termino con {:?}",
+            status.code()
+        )));
+    }
+    let out = process::Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height,codec_name,nb_frames",
+        ])
+        .args(["-of", "csv=s=x:p=0"])
+        .arg(output)
+        .output()
+        .map_err(io_err)?;
+    eprintln!("{}", String::from_utf8_lossy(&out.stdout).trim_end());
+    Ok(())
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -991,6 +1281,27 @@ fn run() -> i32 {
             color,
         } => cmd_export(file, output, width, height, fit, color),
         Cmd::Info { ref file } => cmd_info(file),
+        Cmd::Render {
+            ref file,
+            ref output,
+            ref res,
+            fps,
+            color,
+            ref font,
+            ref audio_from,
+            scanlines,
+        } => cmd_render(
+            file,
+            &RenderOpts {
+                output,
+                res,
+                fps,
+                color,
+                font: font.as_deref(),
+                audio_from: audio_from.as_deref(),
+                scanlines,
+            },
+        ),
     };
     match res {
         Ok(()) => 0,
