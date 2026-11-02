@@ -106,6 +106,13 @@ impl GlyphAtlas {
     /// Motor TTF real: rasteriza los 512 codepoints con `fontdue` (100%
     /// Pure Rust) y compone la cobertura en la celda, centrada y clipped.
     /// Devuelve None si la fuente no carga (el caller degrada a procedural).
+    ///
+    /// POLÍTICA ANTI-`.notdef`: `fontdue` devuelve el glifo índice 0
+    /// (`.notdef`, el cuadrito con "?") cuando el codepoint no existe en la
+    /// fuente. Para glifos geométricos críticos (Block Elements, Sextantes/
+    /// Octantes del Legacy Computing y TODOS los codepoints que la fuente no
+    /// tenga) nos quedamos con el atlas PROCEDURAL: máscara matemática
+    /// escalada a la celda exacta, borde con borde, sin márgenes ni "?".
     pub fn from_font(font_data: Vec<u8>, cell_w: usize, cell_h: usize) -> Option<Self> {
         let font = fontdue::Font::from_bytes(font_data, fontdue::FontSettings::default()).ok()?;
         let cell_w = cell_w.max(1);
@@ -114,6 +121,16 @@ impl GlyphAtlas {
         for id in 0..atlas::ATLAS_LEN {
             let c = atlas::codepoint(id as u16);
             if c == '\0' {
+                continue;
+            }
+            // ¿La fuente real conoce este codepoint? Si no, procedural.
+            if font.lookup_glyph_index(c) == 0 {
+                continue; // `me` ya tiene la máscara procedural para este id.
+            }
+            // Familias geométricas críticas: SIEMPRE procedural (sin márgenes
+            // de fuente; encajan al 100 % borde con borde).
+            let geometric = (130..=160).contains(&id) || (455..=511).contains(&id);
+            if geometric {
                 continue;
             }
             let (m, bmp) = font.rasterize(c, cell_h as f32);
@@ -440,5 +457,54 @@ mod tests {
         assert_eq!(buf[o], (255 * 215 / 255) as u8); // ~85% del brillo
         let first = (geo.off_y * 8 + geo.off_x) * 3;
         assert_eq!(buf[first], 255);
+    }
+}
+
+#[cfg(test)]
+mod anti_notdef_tests {
+    use super::*;
+
+    /// Con una TTF real (si existe ~/.termux/font.ttf): los rangos geométricos
+    /// (Block Elements 130..=160 y Sextantes/Octantes 455..=511) DEBEN quedar
+    /// idénticos al atlas procedural, aunque la fuente NO incluya esos
+    /// codepoints (anti `.notdef`: fontdue devuelve índice 0 = "¿?").
+    #[test]
+    fn from_font_keeps_procedural_for_geometric_ids() {
+        let Some(home) = std::env::var_os("HOME") else {
+            return;
+        };
+        let p = std::path::PathBuf::from(home)
+            .join(".termux")
+            .join("font.ttf");
+        let Ok(data) = std::fs::read(&p) else {
+            eprintln!("skip: sin {} para probar el anti-notdef", p.display());
+            return;
+        };
+        let (cell_w, cell_h) = (16usize, 32usize);
+        let Some(tf) = GlyphAtlas::from_font(data, cell_w, cell_h) else {
+            eprintln!("skip: {} no es una TTF legible", p.display());
+            return;
+        };
+        let pr = GlyphAtlas::procedural(cell_w, cell_h);
+        for id in [130u16, 140, 155, 160, 455, 470, 500, 511] {
+            for py in 0..cell_h {
+                for px in 0..cell_w {
+                    assert_eq!(
+                        tf.coverage(id, px, py),
+                        pr.coverage(id, px, py),
+                        "id {} px {} py {}: el TTF no debe pisar lo procedural",
+                        id,
+                        px,
+                        py
+                    );
+                }
+            }
+        }
+        // Y al menos un codepoint NO geométrico sí debe provenir de la
+        // fuente real si la fuente lo conoce (JUnit de corroboración).
+        let a = tf.coverage(1, cell_w / 2, cell_h / 2);
+        let b = pr.coverage(1, cell_w / 2, cell_h / 2);
+        assert_eq!(a, 255, "el bloque completo (id 1) debe estar lleno");
+        assert_eq!(a, b);
     }
 }

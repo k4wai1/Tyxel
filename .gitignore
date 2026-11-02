@@ -8,3 +8,4 @@
 # Temporales de pruebas
 *.ansi
 *.txa.out
+/Renders/
