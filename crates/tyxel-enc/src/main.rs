@@ -121,8 +121,9 @@ enum Cmd {
         /// Alto en px de los frames fuente (--raw-rgb).
         #[arg(long)]
         h: Option<u32>,
-        #[arg(long, default_value_t = 30)]
-        fps: u32,
+        /// FPS objetivo (detecta el nativo del video si falta, capado a 30).
+        #[arg(long)]
+        fps: Option<u32>,
         #[arg(short = 'o', long = "output")]
         output: String,
         #[arg(long, default_value_t = 120)]
@@ -137,6 +138,11 @@ enum Fit {
 }
 
 fn main() {
+    // CLI correcto: morir con SIGPIPE estándar (sin pánico) si el consumidor
+    // del stdout se cierra (ej. `| head`).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let res = match cli.cmd {
         Cmd::Img {
@@ -264,6 +270,16 @@ fn resize_nn_rgb(src: &[u8], sw: usize, sh: usize, dw: usize, dh: usize) -> Res<
     Ok(out)
 }
 
+/// Pool de Matchers (uno por hilo) creado UNA sola vez por ejecución: la
+/// caché direct-mapped de 64K entradas (~1 MB) no debe realocarse por frame.
+fn new_matcher_pool() -> Vec<Matcher> {
+    let n = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8);
+    (0..n).map(|_| Matcher::new()).collect()
+}
+
 fn txv_header(w: u16, h: u16, fps_num: u16) -> TxvHeader {
     TxvHeader {
         width: w,
@@ -273,7 +289,7 @@ fn txv_header(w: u16, h: u16, fps_num: u16) -> TxvHeader {
         total_frames: 0,
         nerdfont: true,
         color: ColorMode::Truecolor,
-        compression: Compression::None,
+        compression: Compression::Lz4,
         atlas_id: 0,
     }
 }
@@ -399,7 +415,12 @@ fn encode_img(
     };
 
     let pixels = resized.into_raw();
-    let cells = Matcher::new().match_frame(w as usize, h as usize, &pixels);
+    let cells = {
+        let mut pool = new_matcher_pool();
+        tyxel_core::matcher::Matcher::match_frame_parallel(
+            &mut pool, w as usize, h as usize, &pixels,
+        )
+    };
     write_single_image(output, w, h, &cells)
 }
 
@@ -407,7 +428,7 @@ fn encode_img(
 
 /// Convierte un frame GIF (max. compuesto si difiere del lienzo 0) a celdas.
 fn gif_frame_cells(
-    matcher: &mut Matcher,
+    pool: &mut [Matcher],
     frame: &image::Frame,
     canvas_dims: (u32, u32),
     prev_full: &Option<image::RgbaImage>,
@@ -437,7 +458,12 @@ fn gif_frame_cells(
     let rgb = rgba_to_rgb_image(&full);
     let (tw, th) = (grid.0 as u32 * 8, grid.1 as u32 * 16);
     let resized = resize_rgb(&rgb, tw, th);
-    Ok(matcher.match_frame(grid.0 as usize, grid.1 as usize, &resized.into_raw()))
+    Ok(Matcher::match_frame_parallel(
+        pool,
+        grid.0 as usize,
+        grid.1 as usize,
+        &resized.into_raw(),
+    ))
 }
 
 fn frame_delay_ms(frame: &image::Frame) -> u32 {
@@ -475,7 +501,7 @@ fn encode_gif(
         .unwrap_or(30);
     let fps_override_ms = fps.filter(|f| *f > 0).map(|f| (1000 / f).max(1));
 
-    let mut matcher = Matcher::new();
+    let mut pool = new_matcher_pool();
     let out_file = BufWriter::new(File::create(output)?);
     let mut emitter = FrameEmitter::new(
         TxvWriter::new(out_file, txv_header(grid.0, grid.1, fps_num))?,
@@ -484,7 +510,7 @@ fn encode_gif(
 
     let mut prev_full: Option<image::RgbaImage> = None;
     let first_ms = fps_override_ms.unwrap_or_else(|| frame_delay_ms(&first));
-    let cells = gif_frame_cells(&mut matcher, &first, canvas_dims, &prev_full, grid)?;
+    let cells = gif_frame_cells(&mut pool, &first, canvas_dims, &prev_full, grid)?;
     emitter.push(&cells, first_ms)?;
     prev_full = Some(first.buffer().clone());
     let mut n_read = 1u32;
@@ -493,7 +519,7 @@ fn encode_gif(
         let fr = fr?;
         n_read += 1;
         let ms = fps_override_ms.unwrap_or_else(|| frame_delay_ms(&fr));
-        let cur = gif_frame_cells(&mut matcher, &fr, canvas_dims, &prev_full, grid)?;
+        let cur = gif_frame_cells(&mut pool, &fr, canvas_dims, &prev_full, grid)?;
         emitter.push(&cur, ms)?;
         if (fr.buffer().width(), fr.buffer().height()) == canvas_dims {
             prev_full = Some(fr.buffer().clone());
@@ -529,6 +555,125 @@ fn encode_gif(
     ))
 }
 
+/// Sondea las dimensiones nativas (ancho, alto) de un archivo de video con
+/// ffprobe (flujo v:0). Neceesario para derivar la cuadrilla con aspect ratio
+/// real cuando el usuario solo pasa --width o --height.
+fn probe_video_dims(path: &str, want_fps: bool) -> Res<(u32, u32, Option<f64>)> {
+    let entries = if want_fps {
+        "stream=width,height,avg_frame_rate"
+    } else {
+        "stream=width,height"
+    };
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            entries,
+            "-of",
+            "csv=s=x:p=0",
+            path,
+        ])
+        .output()
+        .map_err(|e| {
+            EncError::Msg(format!(
+                "no se pudo lanzar ffprobe (instálalo con `pkg install ffmpeg`): {e}"
+            ))
+        })?;
+    if !out.status.success() {
+        return err(format!(
+            "ffprobe falló al leer {path} (¿el archivo existe y es un video válido?)"
+        ));
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let mut parts = s.split('x');
+    let parse_dims = |a: &str, b: &str| -> Option<(u32, u32)> {
+        let w = a.trim().parse::<u32>().ok();
+        let h = b.trim().parse::<u32>().ok();
+        match (w, h) {
+            (Some(w), Some(h)) if w > 0 && h > 0 => Some((w, h)),
+            _ => None,
+        }
+    };
+    let (a, b, fps_raw) = (
+        parts.next(),
+        parts.next(),
+        parts.next().and_then(|f| {
+            let (num, den) = f.split_once('/')?;
+            let num = (num.trim().parse::<f64>()).ok()?;
+            let den = (den.trim().parse::<f64>()).ok()?;
+            if den > 0.0 { Some(num / den) } else { None }
+        }),
+    );
+    let (aw, ah) = match (a, b) {
+        (Some(a), Some(b)) => match parse_dims(a, b) {
+            Some((w, h)) => (w, h),
+            None => return err(format!("ffprobe: salida no legible: {s:?}")),
+        },
+        _ => return err(format!("ffprobe: salida no legible: {s:?}")),
+    };
+    let mut w = aw;
+    let mut h = ah;
+    let native = fps_raw;
+    // La rotación vive en el display matrix (stream side data): videos
+    // grabados con el teléfono declaran ±90/±270. Si está presente, el
+    // tamaño "real" de la pantalla es el intercambiado.
+    if let Some(rd) = probe_video_rotation(path) {
+        let rd = rd.rem_euclid(360.0).round() as i32;
+        if rd == 90 || rd == 270 {
+            std::mem::swap(&mut w, &mut h);
+        }
+    }
+    Ok((w, h, native))
+}
+
+/// Busca la rotación del display matrix en el side data del primer frame.
+/// Devuelve grados (0/±90/±180/±270) o None si no hay.
+fn probe_video_rotation(path: &str) -> Option<f64> {
+    let out = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-read_intervals",
+            "%+#2",
+            path,
+        ])
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    let mut in_matrix = false;
+    for line in s.lines() {
+        let line = line.trim();
+        if line == "[/SIDE_DATA]" {
+            in_matrix = false;
+            continue;
+        }
+        if line.starts_with("[SIDE_DATA]") {
+            in_matrix = true;
+            continue;
+        }
+        if in_matrix
+            && line.contains("Display Mat")
+            && (line.contains("side_data_type") || line.contains("matrix"))
+        {
+            continue;
+        }
+        if in_matrix {
+            if let Some(rest) = line.strip_prefix("rotation=") {
+                if let Ok(deg) = rest.trim_end().parse::<f64>() {
+                    return Some(deg);
+                }
+            }
+        }
+    }
+    None
+}
+
 // ---------- Subcomando video ----------
 
 /// Envoltorio que mantiene vivo el proceso ffmpeg mientras se leen sus frames.
@@ -559,19 +704,31 @@ fn encode_video(
     height: Option<u16>,
     src_w: Option<u32>,
     src_h: Option<u32>,
-    fps: u32,
+    fps_in: Option<u32>,
     output: &str,
     keyframe_interval: u32,
 ) -> Res<String> {
     if !is_ext(output, "txv") {
         return err(format!("video requiere salida .txv (hay {output})"));
     }
-    if fps == 0 {
-        return err("--fps debe ser > 0");
-    }
-    if fps > u16::MAX as u32 {
-        return err(format!("--fps excede u16: {fps}"));
-    }
+    // Fallback: sin --fps explícito se detecta el framerate nativo del video
+    // con ffprobe, capado a 30 FPS (temermux + Helio G99 no vuelan a 60).
+    let fps: u32 = match fps_in {
+        Some(0) => return err("--fps debe ser > 0"),
+        Some(f) if f > u16::MAX as u32 => return err(format!("--fps excede u16: {f}")),
+        Some(f) => f,
+        None => {
+            if raw_rgb {
+                30
+            } else {
+                let path = video.as_deref().unwrap_or_default();
+                let (_, _, native) = probe_video_dims(path, true)?;
+                let nf = native.unwrap_or(30.0).clamp(1.0, 30.0);
+                let v = nf.round().max(1.0) as u32;
+                u16::try_from(v).unwrap_or(u16::MAX) as u32
+            }
+        }
+    };
 
     if video.is_some() && raw_rgb {
         return err("video: usa solo una fuente de entrada (--video o --raw-rgb)");
@@ -582,10 +739,20 @@ fn encode_video(
 
     // Resolución de la fuente y de la cuadrilla target.
     let (from_ffmpeg, frame_src_w, frame_src_h, grid_w, grid_h) = if video.is_some() {
-        let (gw, gh) = match (width, height) {
-            (Some(w), Some(h)) => (w, h),
-            _ => return err("--video requiere --width y --height (cuadrilla target)"),
+        // Aspecto automático: si falta --width o --height, se sondea el video
+        // original con ffprobe y se aplica la corrección de celda 1:2.
+        let probe = match (width, height) {
+            (Some(w), Some(h)) => ((0, 0), w, h),
+            _ => {
+                let v = video
+                    .as_deref()
+                    .ok_or_else(|| EncError::Msg(String::from("sin fuente")))?;
+                let (sw, sh, _native) = probe_video_dims(v, false)?;
+                let (dw, dh) = derive_cells(sw, sh, width, height)?;
+                ((sw, sh), dw, dh)
+            }
         };
+        let (_, gw, gh) = probe;
         (true, 0u32, 0u32, gw, gh)
     } else {
         let (tw, th) = match (src_w, src_h) {
@@ -619,7 +786,7 @@ fn encode_video(
                 "-pix_fmt",
                 "rgb24",
                 "-vf",
-                &format!("scale={tw}:{th}"),
+                &format!("scale={tw}:{th}:flags=lanczos"),
                 "-r",
                 &fps.to_string(),
                 "-",
@@ -686,7 +853,7 @@ fn run_video_loop(
         return err(String::from("cuadrilla target nula"));
     }
 
-    let mut matcher = Matcher::new();
+    let mut pool = new_matcher_pool();
     let out_file = BufWriter::new(File::create(output)?);
     let mut emitter = FrameEmitter::new(
         TxvWriter::new(
@@ -713,7 +880,8 @@ fn run_video_loop(
             let sh = src_h as usize;
             resize_nn_rgb(&buf, sw, sh, grid_w as usize * 8, grid_h as usize * 16)?
         };
-        let cur = matcher.match_frame(grid_w as usize, grid_h as usize, &pixels);
+        let cur =
+            Matcher::match_frame_parallel(&mut pool, grid_w as usize, grid_h as usize, &pixels);
         emitter.push(&cur, frame_ms)?;
         n_read += 1;
     }

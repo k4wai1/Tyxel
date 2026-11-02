@@ -305,6 +305,25 @@ struct Painter {
     bg: Paint,
 }
 
+/// Cercanía perceptual entre dos pints: tolerancia de Manhattan RGB <= 9.
+/// Evita repetir SGRs de colores que el ojo no distingue (flush por frame
+/// más compacto): solo aplica en tintes TrueColor/256 por índice igual.
+#[inline]
+fn paints_close(a: &Paint, b: &Paint) -> bool {
+    match (a, b) {
+        (Paint::Rgb(x), Paint::Rgb(y)) => {
+            let m = x[0].abs_diff(y[0]) as u32
+                + x[1].abs_diff(y[1]) as u32
+                + x[2].abs_diff(y[2]) as u32;
+            m <= 9
+        }
+        (Paint::Mono, Paint::Mono) => true,
+        (Paint::Idx256(x), Paint::Idx256(y)) => x == y,
+        (Paint::Idx16(x), Paint::Idx16(y)) => x == y,
+        _ => false,
+    }
+}
+
 impl Painter {
     fn new(mode: ColorChoice) -> Self {
         Self {
@@ -340,11 +359,11 @@ impl Painter {
     fn put<W: IoWrite>(&mut self, w: &mut W, t: &Tyxel, x: u16, y: u16) -> io::Result<()> {
         let nfg = self.quant(t.fg, x, y);
         let nbg = self.quant(t.bg, x, y);
-        if nfg != self.fg {
+        if !paints_close(&nfg, &self.fg) {
             emit_fg(w, nfg)?;
             self.fg = nfg;
         }
-        if nbg != self.bg {
+        if !paints_close(&nbg, &self.bg) {
             emit_bg(w, nbg)?;
             self.bg = nbg;
         }
@@ -463,6 +482,8 @@ struct PlaySource {
     height: u16,
     /// Duración por defecto (ms) cuando `duration_ms == 0`, derivada del fps.
     default_ms: u64,
+    /// FPS declarado en el archivo (para escalar cadencias con --fps-override).
+    fps_tag: f64,
     frames: Vec<TxvFrame>,
 }
 
@@ -497,6 +518,7 @@ fn load_play_source(path: &Path, override_fps: Option<u16>) -> Result<PlaySource
             width: h.width,
             height: h.height,
             default_ms: detect_fps_default(h.fps_num, h.fps_den, override_fps),
+            fps_tag: (h.fps_num as f64 / h.fps_den.max(1) as f64).max(1.0),
             frames: txv.frames,
         })
     } else {
@@ -506,6 +528,7 @@ fn load_play_source(path: &Path, override_fps: Option<u16>) -> Result<PlaySource
             width: img.width,
             height: img.height,
             default_ms: detect_fps_default(30, 1, override_fps),
+            fps_tag: 30.0,
             frames: vec![TxvFrame {
                 frame_type: txv::FRAME_TYPE_I,
                 duration_ms: 0,
@@ -652,7 +675,8 @@ fn load_txa_fitted(
 // Subcomandos
 // ============================================================================
 
-/// Espera sin drift hasta `target`: sleep grueso + spin fino (últimos ~2 ms).
+/// Espera sin drift hasta `target`: sleep grueso + spin muy corto (últimos
+/// ~250 us), para no quemar un núcleo mientras Termux pinta la pantalla.
 fn wait_until(target: Instant) {
     loop {
         let now = Instant::now();
@@ -660,8 +684,8 @@ fn wait_until(target: Instant) {
         if d.is_zero() {
             return;
         }
-        if d > Duration::from_millis(2) {
-            std::thread::sleep(d - Duration::from_millis(2));
+        if d > Duration::from_micros(250) {
+            std::thread::sleep(d - Duration::from_micros(250));
         } else {
             std::hint::spin_loop();
         }
@@ -679,6 +703,10 @@ fn cmd_play(
     let _guard = TerminalGuard::enter().map_err(|e: AppError| e)?;
     let mut out = BufWriter::with_capacity(64 * 1024, io::stdout().lock());
     let mut painter = Painter::new(mode);
+    // Buffer del fotograma REUTILIZADO (clear + write_all, cero alocaciones
+    // por frame): cada frame se arma completo en RAM y se emite con un
+    // único write_all + flush al stdout (menos syscalls, tearing cero).
+    let mut frame_buf: Vec<u8> = Vec::with_capacity(64 * 1024);
 
     // Página limpia antes de la primera emisión de frames.
     let _ = out.write_all(b"\x1b[2J");
@@ -690,10 +718,23 @@ fn cmd_play(
 
     loop {
         for frame in &src.frames {
-            let dur_ms: u128 = if frame.duration_ms == 0 {
-                src.default_ms as u128
-            } else {
-                frame.duration_ms as u128
+            // Cadencia efectiva: --fps-override escala TODOS los duration_ms
+            // del archivo (factor fps_tag / fps_efectivo), no solo el default.
+            let dur_ms: u128 = {
+                let raw = if frame.duration_ms == 0 {
+                    src.default_ms as f64
+                } else {
+                    frame.duration_ms as f64
+                };
+                if let Some(f) = fps_override {
+                    if f > 0 && src.fps_tag > 0.0 {
+                        (raw * src.fps_tag / f as f64).round().max(1.0) as u128
+                    } else {
+                        raw as u128
+                    }
+                } else {
+                    raw as u128
+                }
             };
             let target = start + Duration::from_millis(accum_ms as u64);
             wait_until(target);
@@ -717,24 +758,28 @@ fn cmd_play(
                         ),
                     );
                 }
-                dec_sync_begin(&mut out).map_err(io_err)?;
+                // ARMADO COMPLETO EN RAM: DEC sync + frame en frame_buf.
+                dec_sync_begin(&mut frame_buf).map_err(io_err)?;
                 match &prev {
                     Some(p) => {
                         let dirty = count_dirty(p, cur);
                         if (dirty as f64) < DIRTY_MAX_RATIO * expected as f64 {
-                            let _ = render_dirty(&mut out, p, cur, src.width, &mut painter)
+                            let _ = render_dirty(&mut frame_buf, p, cur, src.width, &mut painter)
                                 .map_err(io_err)?;
                         } else {
-                            render_full(&mut out, cur, src.width, src.height, &mut painter)
+                            render_full(&mut frame_buf, cur, src.width, src.height, &mut painter)
                                 .map_err(io_err)?;
                         }
                     }
                     None => {
-                        render_full(&mut out, cur, src.width, src.height, &mut painter)
+                        render_full(&mut frame_buf, cur, src.width, src.height, &mut painter)
                             .map_err(io_err)?;
                     }
                 }
-                dec_sync_end(&mut out).map_err(io_err)?;
+                dec_sync_end(&mut frame_buf).map_err(io_err)?;
+                // FLUSH ÚNICO por fotograma: la terminal recibe el frame
+                // entero en una sola escritura una vez armado.
+                out.write_all(&frame_buf).map_err(io_err)?;
                 out.flush().map_err(io_err)?;
                 prev = Some(cur.clone());
             }
@@ -850,6 +895,32 @@ fn cmd_info(file: &Path) -> Result<(), AppError> {
         println!("p-frames: {}", n_p);
         println!("duracion: {:.2} s", total_ms as f64 / 1000.0);
         println!("tamano: {} bytes", data.len());
+        // Riqueza de glifos del video completo (todas las celdas de todos
+        // los frames, materializadas por el parser).
+        let mut glyphs = HashSet::new();
+        let mut total_cells = 0usize;
+        let mut flat_cells = 0usize;
+        for f in &txv.frames {
+            let prev_len = glyphs.len();
+            for &t in &f.cells {
+                total_cells += 1;
+                let id = t.glyph_id % atlas::ATLAS_LEN as u16;
+                glyphs.insert(id);
+                if id == 0 || id == 1 {
+                    flat_cells += 1;
+                }
+            }
+            let _ = glyphs.len() - prev_len;
+        }
+        println!("glifos_unicos: {}", glyphs.len());
+        println!(
+            "planas(espacio/bloque): {:.1}%",
+            if total_cells > 0 {
+                flat_cells as f64 * 100.0 / total_cells as f64
+            } else {
+                0.0
+            }
+        );
         println!("atlas_id: {}", h.atlas_id);
         println!(
             "nerd_fonts: {}",
@@ -891,6 +962,11 @@ fn cmd_info(file: &Path) -> Result<(), AppError> {
 // ============================================================================
 
 fn run() -> i32 {
+    // CLI correcto: morir con SIGPIPE estándar (sin pánico) si el consumidor
+    // del stdout se cierra (ej. `| head`).
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     let res = match cli.cmd {
         Cmd::Play {

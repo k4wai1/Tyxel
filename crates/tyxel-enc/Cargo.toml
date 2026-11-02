@@ -9,4 +9,5 @@ description = "Tyxel encoder CLI: image/video -> .txa/.txv (pure Rust, no C bind
 [dependencies]
 tyxel-core = { path = "../tyxel-core" }
 clap = { version = "4", features = ["derive"] }
+libc = "0.2.174"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }

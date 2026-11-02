@@ -1,9 +1,6 @@
 # Build
 /target/
 
-# Assets de prueba (imágenes y videos) — excluidos del repo
-/Test/
-
 # Editor / SO
 *.swp
 .DS_Store

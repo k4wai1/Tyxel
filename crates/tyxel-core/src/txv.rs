@@ -191,8 +191,7 @@ pub fn delta_ops(prev: &[Tyxel], cur: &[Tyxel]) -> Vec<Op> {
                 while j < seg.len() && (j + 1 >= seg.len() || seg[j + 1] != seg[j]) {
                     j += 1;
                 }
-                let _ = lit_start;
-                ops.push(Op::Literal(seg[0..j].to_vec()));
+                ops.push(Op::Literal(seg[lit_start..j].to_vec()));
             }
         }
     }

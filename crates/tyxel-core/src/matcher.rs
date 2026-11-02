@@ -23,6 +23,14 @@ use crate::tyxel::Tyxel;
 const ATLAS_LEN: usize = 512;
 const BLOCK_LEN: usize = 64;
 
+/// Celda declarada plana: max-min por canal <= FLAT_AMP en los tres canales.
+const FLAT_AMP: u8 = 5;
+/// Amplitud debajo de la cual la luminancia perceptual domina la bipartición
+/// (los 3 canales amplitudes menores que esto).
+const LOW_AMP: u8 = 24;
+/// Candidatos por Hamming que se evalúan contra el error cromático real.
+const TOP_K: usize = 4;
+
 /// Métricas opcionales de un match (útil para análisis de codificación).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MatchMetrics {
@@ -106,7 +114,7 @@ fn choose_axis(amps: [u8; 3]) -> u32 {
         axis = 2;
         best = amps[2];
     }
-    if best < 24 { 3 } else { axis }
+    if best < LOW_AMP { 3 } else { axis }
 }
 
 #[inline]
@@ -125,6 +133,27 @@ fn dist2_rgb(a: [u8; 3], b: [u8; 3]) -> u32 {
     let dg = a[1] as i32 - b[1] as i32;
     let db = a[2] as i32 - b[2] as i32;
     (dr * dr + dg * dg + db * db) as u32
+}
+
+/// Inserta un candidato en el top-K por Hamming (mantienen orden ascendente,
+/// O(K) por mis de caché: K=4).
+#[inline]
+fn insert_candidate(cands: &mut [(u32, u16, bool); TOP_K], diff: u32, id: u16, invert: bool) {
+    if diff >= cands[TOP_K - 1].0 {
+        return;
+    }
+    for k in 0..TOP_K {
+        if diff < cands[k].0 {
+            for m in ((k + 1)..TOP_K).rev() {
+                cands[m] = cands[m - 1];
+            }
+            cands[k] = (diff, id, invert);
+            break;
+        }
+        if diff == cands[k].0 {
+            return; // empate: gana el primero encontrado (id menor)
+        }
+    }
 }
 
 /// Bipartición por la media del eje elegido: centroides C_0 (píxeles con valor
@@ -221,12 +250,17 @@ impl Matcher {
     }
 
     /// Match con métricas adicionales (`variance` y `popcount` del objetivo).
+    ///
+    /// Pipeline: (1) plano solo si el rango por canal es <= `FLAT_AMP` en los
+    /// tres; (2) bipartición multi-eje (canal dominante + luminancia), cada
+    /// objetivo pasa por Hamming top-K y el ganador final se elige por el
+    /// error cromático real de la reconstrucción. La caché direct-mapped
+    /// sigue keyed por `target_mask`.
     pub fn match_block_metrics(&mut self, block: &[[u8; 3]; BLOCK_LEN]) -> (Tyxel, MatchMetrics) {
         debug_assert_eq!(block.len(), BLOCK_LEN);
         let stats = stats_of(block);
         let mean = stats.mean();
         let amps = stats.amplitude();
-        let axis = choose_axis(amps);
 
         let mut sq = 0u64;
         for p in block {
@@ -237,7 +271,7 @@ impl Matcher {
         }
         let variance = sq as f32 / BLOCK_LEN as f32;
 
-        if amps[0] <= 12 && amps[1] <= 12 && amps[2] <= 12 {
+        if amps[0] <= FLAT_AMP && amps[1] <= FLAT_AMP && amps[2] <= FLAT_AMP {
             return (
                 Tyxel {
                     glyph_id: 0,
@@ -251,42 +285,77 @@ impl Matcher {
             );
         }
 
-        let (target, _c0, _c1) = bipartite(block, axis);
+        let dominant = choose_axis(amps);
+        let axes: [u32; 2] = if dominant == 3 { [3, 3] } else { [dominant, 3] };
 
-        let slot = slot_of(target);
-        let (glyph_id, invert) = if self.cache[slot].0 == target {
-            (self.cache[slot].1, self.cache[slot].2)
-        } else {
-            self.search_and_store(target, slot)
-        };
+        let mut best_err = u32::MAX;
+        let mut best_t = Tyxel::default();
+        let mut best_pop = 0u32;
+        for axis in axes {
+            let (target, _c0, _c1) = bipartite(block, axis);
+            // Máscara degenerada (una sola partida de bits) = plano real.
+            if target == 0 || target == u64::MAX {
+                continue;
+            }
+            let slot = slot_of(target);
+            let (glyph_id, invert) = if self.cache[slot].0 == target {
+                (self.cache[slot].1, self.cache[slot].2)
+            } else {
+                let (_err, gid, inv) = Self::refine_target(block, target);
+                self.cache[slot] = (target, gid, inv);
+                (gid, inv)
+            };
 
-        let winner = atlas::mask(glyph_id);
-        let (fg_natural, bg_natural) = recolor(block, winner);
-        let (fg, bg) = if invert {
-            (bg_natural, fg_natural)
-        } else {
-            (fg_natural, bg_natural)
-        };
+            let winner = atlas::mask(glyph_id);
+            let (fg_natural, bg_natural) = recolor(block, winner);
+            let (fg, bg) = if invert {
+                (bg_natural, fg_natural)
+            } else {
+                (fg_natural, bg_natural)
+            };
+            let mut err = 0u32;
+            for (i, p) in block.iter().enumerate() {
+                let ref_c = if (target >> i) & 1 == 1 { fg } else { bg };
+                err += dist2_rgb(*p, ref_c);
+            }
+            if err < best_err {
+                best_err = err;
+                best_t = Tyxel { glyph_id, fg, bg };
+                best_pop = target.count_ones();
+            }
+        }
+
+        if best_err == u32::MAX {
+            return (
+                Tyxel {
+                    glyph_id: 0,
+                    fg: mean,
+                    bg: mean,
+                },
+                MatchMetrics {
+                    variance,
+                    popcount: 0,
+                },
+            );
+        }
 
         (
-            Tyxel { glyph_id, fg, bg },
+            best_t,
             MatchMetrics {
                 variance,
-                popcount: target.count_ones(),
+                popcount: best_pop,
             },
         )
     }
 
-    /// Búsqueda lineal branchless sobre las 512 máscaras del atlas (solo en miss
-    /// de caché): `diff_normal = count_ones(target ^ m)` y
-    /// `diff_invert = count_ones(!target ^ m)`; gana la menor distancia de
-    /// Hamming y los empates favorecen la orientación normal.
+    /// Ganador real de un `target` fijo (solo leaf del miss de caché):
+    /// Hamming top-`TOP_K` sobre las 512 máscaras y después recomposición
+    /// cromática real de cada candidato (recolor + SAD-RGB) — un glifo fino
+    /// puede ganarle al bloque lleno si reproduce mejor los colores.
     #[cold]
     #[inline(never)]
-    fn search_and_store(&mut self, target: u64, slot: usize) -> (u16, bool) {
-        let mut best_diff = u32::MAX;
-        let mut best_id = 0u16;
-        let mut best_invert = false;
+    fn refine_target(block: &[[u8; 3]; BLOCK_LEN], target: u64) -> (u32, u16, bool) {
+        let mut cands: [(u32, u16, bool); TOP_K] = [(u32::MAX, 0, false); TOP_K];
         for id in 0..ATLAS_LEN {
             let m = atlas::MASKS[id];
             let diff_normal = (target ^ m).count_ones();
@@ -296,14 +365,28 @@ impl Matcher {
             } else {
                 (diff_normal, false)
             };
-            if diff < best_diff {
-                best_diff = diff;
-                best_id = id as u16;
-                best_invert = invert;
+            insert_candidate(&mut cands, diff, id as u16, invert);
+        }
+        let mut best = (u32::MAX, 0u16, false);
+        for &(diff, id, invert) in cands.iter() {
+            if diff == u32::MAX {
+                break;
+            }
+            let mask = atlas::mask(id);
+            let (mut fg, mut bg) = recolor(block, mask);
+            if invert {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let mut err = 0u32;
+            for (i, p) in block.iter().enumerate() {
+                let ref_c = if (target >> i) & 1 == 1 { fg } else { bg };
+                err += dist2_rgb(*p, ref_c);
+            }
+            if err < best.0 {
+                best = (err, id, invert);
             }
         }
-        self.cache[slot] = (target, best_id, best_invert);
-        (best_id, best_invert)
+        best
     }
 
     /// Codifica una imagen virtual RGB24 de `(width*8) x (height*16)` píxeles
@@ -325,24 +408,94 @@ impl Matcher {
         let mut out = Vec::with_capacity(width * height);
         for cy in 0..height {
             for cx in 0..width {
-                for gy in 0..8usize {
-                    let r0 = (cy * 8 + gy) * 2;
-                    let r1 = r0 + 1;
-                    for gx in 0..8usize {
-                        let c = cx * 8 + gx;
-                        let i0 = (r0 * img_w + c) * 3;
-                        let i1 = (r1 * img_w + c) * 3;
-                        block[gy * 8 + gx] = [
-                            ((pixels[i0] as u16 + pixels[i1] as u16 + 1) / 2) as u8,
-                            ((pixels[i0 + 1] as u16 + pixels[i1 + 1] as u16 + 1) / 2) as u8,
-                            ((pixels[i0 + 2] as u16 + pixels[i1 + 2] as u16 + 1) / 2) as u8,
-                        ];
-                    }
-                }
+                sample_block(pixels, img_w, cx, cy, &mut block);
                 out.push(self.match_block(&block));
             }
         }
         out
+    }
+
+    /// Igual que [`match_frame`] pero reparte las celdas entre un pool
+    /// reutilizable de matchers (uno por hilo, cada uno con su caché propia).
+    /// Los matchers DEBEN crearse una sola vez y sobrevivir entre frames:
+    /// alocarlos por frame destroza rendimiento (1 MB de caché por hilo).
+    pub fn match_frame_parallel(
+        pool: &mut [Matcher],
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+    ) -> Vec<Tyxel> {
+        if pool.len() <= 1 {
+            return pool[0].match_frame(width, height, pixels);
+        }
+        assert!(
+            pixels.len() == width * height * 8 * 16 * 3,
+            "se esperaba RGB24 de {width}x{height} celdas"
+        );
+        use std::thread;
+        let total = width * height;
+        let n = pool.len().min(total);
+        let per = total / n;
+        let rem = total % n;
+        let img_w = width * 8;
+        thread::scope(|s| {
+            let mut handles = Vec::with_capacity(n);
+            let mut start = 0usize;
+            for (k, m) in pool.iter_mut().enumerate().take(n) {
+                let cells = per + usize::from(k < rem);
+                let end = start + cells;
+                let px: &[u8] = pixels;
+                let wc = width;
+                handles.push((
+                    s.spawn(move || {
+                        let mut block = [[0u8; 3]; BLOCK_LEN];
+                        let mut out = Vec::with_capacity(cells);
+                        for idx in start..end {
+                            let cy = idx / wc;
+                            let cx = idx % wc;
+                            sample_block(px, img_w, cx, cy, &mut block);
+                            out.push(m.match_block(&block));
+                        }
+                        out
+                    }),
+                    start,
+                    end,
+                ));
+                start = end;
+            }
+            let mut result = vec![Tyxel::default(); total];
+            for (h, s0, e0) in handles {
+                let part = h.join().expect("hilo de matching");
+                result[s0..e0].copy_from_slice(&part);
+            }
+            result
+        })
+    }
+}
+
+/// Extrae el bloque lógico 8x8 de la celda (cx, cy): por cada fila lógica gy
+/// promedia verticalmente las filas físicas *2 y *2+1 (aspecto 1:2, ADR-006).
+#[inline]
+fn sample_block(
+    pixels: &[u8],
+    img_w: usize,
+    cx: usize,
+    cy: usize,
+    block: &mut [[u8; 3]; BLOCK_LEN],
+) {
+    for gy in 0..8usize {
+        let r0 = (cy * 8 + gy) * 2;
+        let r1 = r0 + 1;
+        for gx in 0..8usize {
+            let c = cx * 8 + gx;
+            let i0 = (r0 * img_w + c) * 3;
+            let i1 = (r1 * img_w + c) * 3;
+            block[gy * 8 + gx] = [
+                ((pixels[i0] as u16 + pixels[i1] as u16 + 1) / 2) as u8,
+                ((pixels[i0 + 1] as u16 + pixels[i1 + 1] as u16 + 1) / 2) as u8,
+                ((pixels[i0 + 2] as u16 + pixels[i1 + 2] as u16 + 1) / 2) as u8,
+            ];
+        }
     }
 }
 
@@ -492,6 +645,109 @@ mod tests {
     fn frame_rejects_bad_len() {
         let mut m = Matcher::new();
         let _ = m.match_frame(2, 2, &[0u8; 10]);
+    }
+
+    /// Test de riqueza: círculos + diagonales + gradiente
+    /// de 4 colores deben despertar >= 40 glifos distintos del atlas de 512
+    /// y una fracción plana baja. Ejercicio además el pool paralelo.
+    #[test]
+    fn rich_frame_uses_many_glyphs() {
+        let (w, h) = (24usize, 16usize);
+        let img_w = w * 8;
+        let img_h = h * 16;
+        let mut px = vec![0u8; img_w * img_h * 3];
+        for y in 0..img_h {
+            let yy = y as f64 / (img_h as f64 - 1.0);
+            for x in 0..img_w {
+                let xx = x as f64 / (img_w as f64 - 1.0);
+                // Gradiente diagonal: R crece en x, G crece en y, B decrece.
+                let mut r = 30.0 + 180.0 * xx;
+                let mut g = 30.0 + 150.0 * yy;
+                let mut b = 190.0 - 150.0 * xx;
+                // Franjas diagonales finas (periodo 4 px): bordes nítidos.
+                let d = x as i32 + y as i32;
+                if d % 4 < 2 {
+                    r *= 0.4;
+                    g *= 0.4;
+                    b *= 0.4;
+                }
+                // Ajedrez grueso de inversión regional (bloques 8x16).
+                let chk = ((x / 8) ^ (y / 16)) & 1 == 1;
+                if chk {
+                    let t = r;
+                    r = b * 0.9;
+                    b = t * 0.8;
+                    g = 255.0 - g;
+                }
+                // Círculo relleno brillante (bodegón con borde limpio).
+                let dx = x as f64 - 60.0;
+                let dy = (y as f64 - 40.0) * 0.5;
+                if dx * dx + dy * dy < 28.0 * 28.0 {
+                    r = 245.0;
+                    g = 240.0;
+                    b = 10.0;
+                }
+                // Textura de ruido fino determinista (LFSR-like): rompe la
+                // monotonía de los gradientes suaves entre franjas.
+                let seed = (x * 31 + y * 57) as u64;
+                let n = (seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as f64;
+                let jitter = (n - 128.0) / 384.0;
+                r += jitter * 42.0;
+                g -= jitter * 42.0;
+                b += jitter * 42.0;
+                let i = (y * img_w + x) * 3;
+                px[i] = r.round().clamp(0.0, 255.0) as u8;
+                px[i + 1] = g.round().clamp(0.0, 255.0) as u8;
+                px[i + 2] = b.round().clamp(0.0, 255.0) as u8;
+            }
+        }
+        let mut pool: Vec<Matcher> = (0..4).map(|_| Matcher::new()).collect();
+        let cells = Matcher::match_frame_parallel(&mut pool, w, h, &px);
+        assert_eq!(cells.len(), w * h);
+        let mut glyphs = std::collections::HashSet::new();
+        let mut flat = 0usize;
+        for c in &cells {
+            glyphs.insert(c.glyph_id);
+            if c.glyph_id == 0 {
+                flat += 1;
+            }
+        }
+        assert!(
+            glyphs.len() >= 40,
+            "se esperaban >= 40 glifos distintos, hubo {}: {:?}",
+            glyphs.len(),
+            {
+                let mut ids: Vec<u16> = glyphs.iter().copied().collect();
+                ids.sort();
+                ids
+            }
+        );
+        // El patrón no debe aplastarse a ladrillos: <= 40% plano.
+        assert!(
+            flat * 4 <= cells.len(),
+            "demasiadas celdas planas: {} de {}",
+            flat,
+            cells.len()
+        );
+    }
+
+    /// La división en catholicas del pool debe reproducir exactamente el mismo
+    /// resultado que el matcher secuencial (determinismo por hilo).
+    #[test]
+    fn parallel_matches_serial() {
+        let (w, h) = (8usize, 4usize);
+        let img_w = w * 8;
+        let img_h = h * 16;
+        let mut px = vec![0u8; img_w * img_h * 3];
+        for (i, v) in px.iter_mut().enumerate() {
+            let p = i % (img_w * 3);
+            *v = ((p * 37 + (i / (img_w * 3)) * 17) % 256) as u8;
+        }
+        let mut single = Matcher::new();
+        let want = single.match_frame(w, h, &px);
+        let mut pool: Vec<Matcher> = (0..6).map(|_| Matcher::new()).collect();
+        let got = Matcher::match_frame_parallel(&mut pool, w, h, &px);
+        assert_eq!(want, got);
     }
 
     #[test]

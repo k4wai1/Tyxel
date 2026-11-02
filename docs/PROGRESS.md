@@ -5,7 +5,9 @@
 
 Fecha de último estado: 2026-10-31
 
-## Estado global: FASE 2 COMPLETA — proyecto funcional de punta a punta
+## Estado global: FASE 2 COMPLETA + matcher de alta fidelidad + multicore + FPS nativo
+
+
 
 ## Módulos
 
@@ -32,6 +34,63 @@ Fecha de último estado: 2026-10-31
 
 ## Bloqueos
 * ninguno.
+
+## Ronda 2 de depuración (fidelidad + multicore + FPS): 2026-11-01
+
+1. Matcher (tyxel-core/src/matcher.rs) reescrito en su núcleo:
+   - Umbral plano drástico: solo celda plana si max-min <= 5 en los 3 canales
+     (antes <= 12); gradientes suaves y bordes medios ya van al atlas.
+   - Bipartición multi-eje: canal dominante + luminancia perceptual
+     (77R+150G+29B); ambos targets compiten.
+   - Selección final por error cromático REAL (recolor + SAD-RGB) entre los
+     top-4 de Hamming; un glifo fino puede ganarle al bloque lleno.
+   - Resultado: .txa de humo con 7 glifos distintos -> .txv reales con
+     397-456 glifos únicos; planas 3-29% (antes ladrillos).
+   - test rich_frame_uses_many_glyphs (>= 40 glifos) y
+     parallel_matches_serial (determinismo del pool).
+2. Multicore: `Matcher::match_frame_parallel(pool, w, h, px)` con
+   std::thread::scope; pool de 8 matchers creado UNA sola vez por ejecución
+   (img/gif/video reutilizan el pool entre frames). El 1080p codificó a
+   ~500% CPU (5 de 8 núcleos) en el G99.
+3. FPS: `--fps` opcional en `tyxel-enc video`; sin valor se detecta el
+   framerate nativo con ffprobe (avg_frame_rate) capado a 30. Los 4 videos
+   de Test/ re-codificados a 30 FPS nativos.
+4. Rotación: probe del display matrix; intercambia W/H con ±90/±270.
+5. `--fps-override` del player reparado: escalaba solo el default_ms y no
+   los duration_ms de los I/P-frames; ahora escala TODAS las cadencias
+   (factor fps_tag/fps_efectivo).
+6. spin del wait_until: 2 ms -> 250 us (no quema un núcleo mientras Termux
+   pinta).
+7. `tyxel-play info` (.txv) ahora reporta glifos_unicos + % planas.
+8. Método de medición: `play --fps-override 240` sobre los .txv reales:
+   234-240 FPS conseguidos (la cadencia pedida se respeta; motor sobra).
+
+## Prueba de fuego con videos reales de Test/ (bugfix round 2026-11-01)
+Bugs encontrados y corregidos al codificar los 4 videos .mp4 de Test/:
+1. `txxel-enc video` exigía `--width` y `--height` a la vez — añadido sondeo
+   con `ffprobe` + `derive_cells` para aspecto automático (solo una de las dos
+   dimensiones, o ninguna). `--height 20` sobre 1920x1080 → 71x20 exacto.
+2. `delta_ops` (tyxel-core/src/txv.rs): la rama del Literal cortaba con
+   `seg[0..j]` en vez de `seg[lit_start..j]`, duplicando el prefijo del
+   segmento tras un Repeat → frames cortos (998/1000) y glitch visual.
+   Este bug no salía en tests golden por falta de patrones Repeat+Literal.
+3. `tyxel-enc` escribía `Compression::None` aunque el core soporta LZ4 —
+   ahora `Compression::Lz4` (bit flags 3-4).
+4. Pánico "failed printing to stdout: Broken pipe" al hacer `tyxel-play info
+   file | head` — ambos binarios instalan `SIGPIPE=SIG_DFL` al arrancar.
+5. Termux: ffmpeg/ffprobe rotos por libs viejas (`libplacebo 7.360.1`,
+   `libx265 4.2`); `pkg upgrade libplacebo libx265` los repara.
+
+También: filtro ffmpeg `scale=WxH:flags=area` (anti-aliasing en downscale).
+
+Resultados de los 4 videos (todos `--height 20 --fps 15`, todos `play` OK):
+| video | celdas | frames | I/P | duración | .txv |
+|---|---|---|---|---|---|
+| 720x576 | 50x20 | 602 | 5/597 | 39.7 s | 3.4 MB |
+| 1920x1080 | 71x20 | 737 | 7/730 | 49.0 s | 6.8 MB |
+| 1280x720 | 71x20 | 198 | 2/196 | 13.1 s | 2.1 MB |
+| YouCut (portrait) | 80x20(?) | 343 | 3/340 | 22.6 s | 3.2 MB |
+
 
 ## Posibles siguientes pasos (v1.1)
 * Streaming .txv real (TxvReader incremental en vez de parse completo) para
