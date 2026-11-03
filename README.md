@@ -24,8 +24,8 @@ Note: video encoding requires `ffmpeg` on the system (Termux: `pkg install ffmpe
 
 ## Room for play: Test folder
 
-The repository ships four real videos plus their ready-made `.txv` files
-(encoded at native 30 FPS, 20 rows tall, aspect ratio preserved):
+The repository ships real videos plus their ready-made `.txv` files
+(from 20-row quick plays to 320x80 ultra-dense conversions):
 
 ```bash
 # Play
@@ -44,9 +44,24 @@ The repository ships four real videos plus their ready-made `.txv` files
 ./target/release/tyxel-play cat Test/logo.txa
 ./target/release/tyxel-play export Test/logo.txa -o logo.ansi
 
-# Render a .txv/.txa to a real MP4 (virtual terminal emulator + H.264)
+# Render a .txv/.txa to a real MP4 (virtual terminal emulator + H.264).
+# The renderer always inspects the SOURCE aspect ratio (DAR) first and builds
+# a letterbox-free canvas of the same proportions (cell 1:2).
 ./target/release/tyxel-play render Test/video.txv -o out.mp4 --res 1080p --fps 30 \
   [--font my.ttf] [--color 256|16|mono] [--audio-from original.mp4] [--scanlines]
+
+# Ultra-dense renders actually shipped in the gallery workflow:
+# YouCut (DAR 2:1) at 320x80 cells ~ 25,600 cells/frame -> same-aspect 1920x960 MP4
+./target/release/tyxel-enc video --video Test/YouCut_20261101_061810107.mp4 \
+  --width 320 --fps 30 -o Renders/YouCut_UHQ320w.txv
+./target/release/tyxel-play render Renders/YouCut_UHQ320w.txv \
+  -o Renders/YouCut_UHQ320w.mp4 --res 1920x960 --fps 30 \
+  --audio-from Test/YouCut_20261101_061810107.mp4
+
+# Batch convert EVERY video in a folder (~/downloads by default), idempotent:
+# pass 1: 180-column density (.txv + 1080p render + audio -> gallery)
+# pass 2: QUARTER-density copy (90 columns = 1/4 cells) -> 720p render -> gallery
+~/Tyxel/tyxel-batch.sh            # or: ~/Tyxel/tyxel-batch.sh /sdcard/Download
 ```
 
 ## Encoding
@@ -87,6 +102,17 @@ Block-to-cell matching is split across a reusable per-thread pool of `Matcher`s
 (`std::thread::scope`), one cache per thread; the pool is created once per run.
 On a Helio G99 the 1080p encode reaches about 500 percent CPU and the playback
 pipeline sustains more than 200 FPS with `--fps-override`.
+
+## MP4 renderer (Fase 3: the virtual terminal emulator)
+
+`tyxel-play render` rebuilds the terminal IN RAM: geometry keeps the cell 1:2
+aspect at integer multiples (`fit_geometry`), glyphs are rasterized either
+procedurally (supersampled mathematical masks, edge-to-edge, no font margins)
+or via a real TTF with `fontdue`; every missing-Nerd-Fonts codepoint falls
+back to the procedural atlas (anti-.notdef policy: never paints a "?" box),
+composition is multithreaded by pixel-row bands, and the RGB24 stream is piped
+into ffmpeg (libx264, CRF 18, yuv420p) with optional audio mapping from the
+original file. See `docs/RENDER_MP4_SPEC.md`.
 
 ## Docs (living documentation in `docs/`)
 
